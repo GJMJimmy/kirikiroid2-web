@@ -90,9 +90,39 @@ elseif(WEB)
         message(FATAL_ERROR
             "Web pthread JSPI targets Emscripten 6.0.9; review its SDK lifecycle hooks before upgrading")
     endif()
+    # WebView 99 / Chromium < 137 移植开关。
+    # JSPI（WebAssembly.Suspending / promising）在 Chromium 137 才可用，而 Android
+    # System WebView 的版本由设备 ROM 与应用商店决定，无法保证升级。开启本项后：
+    #   * 主线程文件读改用同步 XHR 供数（cpp/core/environ/web/VirtualLazyFS.cpp）
+    #   * pthread 改为预建池（无 JSPI 便无法同步等待 Worker 冷启动）
+    #   * 不再链接 pthread_jspi.js/.c 与三个 pthread_create 包装
+    # 方案与在 Chromium 99.0.4844.0 上的实测证据见仓库根 webview99-port-plan.md。
+    option(KRKR2_WEB_NO_JSPI
+        "Build the Web target without JSPI (for Chromium < 137, e.g. Android WebView 99)" OFF)
+    if(KRKR2_WEB_NO_JSPI)
+        set(KRKR2_WEB_JSPI_LINK_OPTIONS "")
+        set(KRKR2_WEB_PTHREAD_SOURCE "")
+    else()
+        set(KRKR2_WEB_JSPI_LINK_OPTIONS
+            "SHELL:-s JSPI=1"
+            "SHELL:-s JSPI_EXPORTS=['krkr2_main_loop_tick']"
+            "SHELL:--js-library ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/pthread_jspi.js"
+            -Wl,--wrap=pthread_create
+            -Wl,--wrap=__pthread_create
+            -Wl,--wrap=emscripten_builtin_pthread_create)
+        set(KRKR2_WEB_PTHREAD_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/pthread_jspi.c)
+    endif()
+    if(KRKR2_WEB_NO_JSPI)
+        # 目录级定义：该宏同时影响 krkr2core（environ/web/VirtualLazyFS.cpp）
+        # 与 krkr2sound（sound/win32/WaveImpl.cpp），不能只加在可执行目标上。
+        add_compile_definitions(KRKR2_WEB_NO_JSPI=1)
+        set(KRKR2_WEB_NO_JSPI_JS "true")
+    else()
+        set(KRKR2_WEB_NO_JSPI_JS "false")
+    endif()
     add_executable(${PROJECT_NAME}
         ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/main.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/pthread_jspi.c)
+        ${KRKR2_WEB_PTHREAD_SOURCE})
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "index" SUFFIX ".html")
     set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY LINK_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/jspi_jsc_mainloop_fix.js
@@ -114,8 +144,15 @@ elseif(WEB)
     endif()
     # Worker 按需初始化：主线程创建时经 JSPI 等待，后台 pthread 经异步代理
     # 等待。已就绪 Worker 仍同步复用；此值只控制可选预热，不再要求覆盖峰值。
-    set(KRKR2_WEB_PTHREAD_POOL_SIZE "0" CACHE STRING
-        "Optional pre-warmed Emscripten pthread workers")
+    # KRKR2_WEB_NO_JSPI：无 JSPI 时 pthread_create 无法等待 Worker 冷启动，
+    # 必须预建池（默认 8），否则线程创建会失败。
+    if(KRKR2_WEB_NO_JSPI)
+        set(KRKR2_WEB_PTHREAD_POOL_SIZE_DEFAULT "8")
+    else()
+        set(KRKR2_WEB_PTHREAD_POOL_SIZE_DEFAULT "0")
+    endif()
+    set(KRKR2_WEB_PTHREAD_POOL_SIZE "${KRKR2_WEB_PTHREAD_POOL_SIZE_DEFAULT}" CACHE STRING
+        "Pre-warmed Emscripten pthread workers (0 = create on demand; JSPI builds only)")
     target_link_options(${PROJECT_NAME} PRIVATE
         "SHELL:-s USE_SDL=2"
         "SHELL:-s USE_SDL_TTF=2"
@@ -148,13 +185,8 @@ elseif(WEB)
         # 包 WebAssembly.promising。该识别靠函数对象身份比较，JSC 不满足
         # table.get/export 身份等价，需用户库覆盖 set_main_loop_arg 兜底，
         # 见 jspi_jsc_mainloop_fix.js。
-        "SHELL:-s JSPI=1"
-        "SHELL:-s JSPI_EXPORTS=['krkr2_main_loop_tick']"
         "SHELL:--js-library ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/jspi_jsc_mainloop_fix.js"
-        "SHELL:--js-library ${CMAKE_CURRENT_SOURCE_DIR}/platforms/web/pthread_jspi.js"
-        -Wl,--wrap=pthread_create
-        -Wl,--wrap=__pthread_create
-        -Wl,--wrap=emscripten_builtin_pthread_create
+        ${KRKR2_WEB_JSPI_LINK_OPTIONS}
         -fwasm-exceptions
         $<$<BOOL:${KRKR2_WEB_ENABLE_SOURCE_MAP}>:-gsource-map>
         $<$<CONFIG:Debug>:--emit-symbol-map>

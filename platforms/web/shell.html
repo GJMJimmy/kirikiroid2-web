@@ -953,13 +953,33 @@
             forceUpdate();
         });
 
-        // --- JSPI 能力检测：主线程文件读依赖 WebAssembly JSPI（VirtualLazyFS），
-        // 缺失时引擎会死在 glue 的 "JSPI not supported" 断言上，用户只能看到
-        // 天书。这里提前检测并按浏览器给出明确的升级/换浏览器指引。---
-        var jspiUnsupported = !(typeof WebAssembly !== 'undefined' &&
+        // --- 能力检测 -------------------------------------------------------
+        // 两种构建形态（由 CMake 注入 KRKR2_WEB_NO_JSPI_JS 区分）：
+        //   * 默认构建：主线程文件读依赖 WebAssembly JSPI（Chromium 137+ /
+        //     WebKit 26.4+）；缺失时 glue 会在 "JSPI not supported" 断言上死掉，
+        //     用户只看到天书，所以这里提前给出明确指引。
+        //   * KRKR2_WEB_NO_JSPI 构建（Android WebView 99 等 Chromium < 137）：
+        //     不依赖 JSPI，改用同步 XHR 供数；但**必须**有跨源隔离
+        //     （COOP/COEP → SharedArrayBuffer）与 wasm 原生异常，
+        //     且懒加载只支持远端 HTTP/WebDAV 资源（见 webview99-port-plan.md）。
+        var hasJspi = typeof WebAssembly !== 'undefined' &&
             typeof WebAssembly.Suspending === 'function' &&
-            typeof WebAssembly.promising === 'function');
-        if (jspiUnsupported) {
+            typeof WebAssembly.promising === 'function';
+        var jspiUnsupported = !hasJspi;
+        var requiresJspi = !@KRKR2_WEB_NO_JSPI_JS@;
+        var missingCapabilities = [];
+        if (requiresJspi && !hasJspi) {
+            missingCapabilities.push('WebAssembly JSPI');
+        }
+        if (self.crossOriginIsolated !== true ||
+            typeof SharedArrayBuffer !== 'function') {
+            missingCapabilities.push(
+                'SharedArrayBuffer / cross-origin isolation (COOP + COEP headers)');
+        }
+        if (typeof WebAssembly.Exception !== 'function') {
+            missingCapabilities.push('WebAssembly exception handling');
+        }
+        if (missingCapabilities.length) {
             (function () {
                 var ua = navigator.userAgent;
                 // iOS 上所有浏览器（含 Chrome 的 CriOS / Firefox 的 FxiOS）都被
@@ -971,19 +991,33 @@
                 var isChromium = /Chrome\/|Chromium\/|Edg\/|OPR\//.test(ua);
                 var isSafari = /Safari\//.test(ua) && !isChromium && !isFirefox;
                 var advice;
-                if (isIOS || isSafari) {
-                    advice = '请升级到 Safari 27（iOS 27）或以上版本。\nPlease upgrade to Safari 27 (iOS 27) or later.';
-                } else if (isFirefox) {
-                    advice = '请改用最新版 Chrome 浏览器。\nPlease use the latest version of Google Chrome instead.';
-                } else if (isChromium) {
-                    advice = '请将浏览器升级到最新版本（需要 Chrome 137 或以上）。\nPlease update your browser to the latest version (Chrome 137 or later).';
+                if (missingCapabilities.length === 1 &&
+                    missingCapabilities[0] === 'WebAssembly JSPI') {
+                    if (isIOS || isSafari) {
+                        advice = '请升级到 Safari 27（iOS 27）或以上版本。\nPlease upgrade to Safari 27 (iOS 27) or later.';
+                    } else if (isFirefox) {
+                        advice = '请改用最新版 Chrome 浏览器。\nPlease use the latest version of Google Chrome instead.';
+                    } else if (isChromium) {
+                        advice = '请将浏览器升级到最新版本（需要 Chrome 137 或以上）。\nPlease update your browser to the latest version (Chrome 137 or later).';
+                    } else {
+                        advice = '请使用最新版 Chrome 浏览器。\nPlease use the latest version of Google Chrome.';
+                    }
                 } else {
-                    advice = '请使用最新版 Chrome 浏览器。\nPlease use the latest version of Google Chrome.';
+                    // 缺的是共享内存/异常处理：要么换内核，要么让服务器补上
+                    // COOP/COEP 响应头（跨源隔离是 SharedArrayBuffer 的前提）。
+                    advice = '本构建需要跨源隔离与 WebAssembly 异常处理。\n' +
+                        '若通过 HTTP 服务器访问，请确保响应包含\n' +
+                        '  Cross-Origin-Opener-Policy: same-origin\n' +
+                        '  Cross-Origin-Embedder-Policy: require-corp\n' +
+                        'This build requires cross-origin isolation (COOP + COEP) and\n' +
+                        'WebAssembly exception handling.';
                 }
                 document.querySelector('#error-box h2').textContent = 'Browser Not Supported';
                 document.getElementById('error-message').textContent =
-                    '当前浏览器缺少引擎所需的 WebAssembly JSPI 能力。\n' +
-                    'This browser lacks WebAssembly JSPI, which the engine requires.\n\n' + advice;
+                    '当前浏览器缺少引擎所需的能力：\n' +
+                    missingCapabilities.join('\n') + '\n\n' +
+                    'This browser lacks required engine capabilities:\n' +
+                    missingCapabilities.join('\n') + '\n\n' + advice;
                 // 强制更新解决不了能力缺失，隐藏避免误导
                 document.getElementById('error-update-btn').style.display = 'none';
                 document.getElementById('error-overlay').classList.add('visible');
@@ -1117,7 +1151,13 @@
             var resp = await fetch('assets.zip?v=@KRKR2_BUILD_VERSION@');
             if (!resp.ok) throw new Error('assets.zip HTTP ' + resp.status);
             var blob = await resp.blob();
-            var r = await VLFS.registerZipBlob(blob, { stripPrefix: '' });
+            var r = await VLFS.registerZipBlob(blob, {
+                stripPrefix: '',
+                // 无 JSPI 构建（WebView 99 / Chromium < 137）：主线程必须能同步
+                // 读到 UI 资源字节，因此把 store 模式的 assets.zip 整包物化到 JS
+                // 堆（不占 wasm 内存；这也是本构建下唯一可行的归档来源）。
+                materialize: @KRKR2_WEB_NO_JSPI_JS@
+            });
             console.log('[vlfs] assets.zip registered: ' + r.paths.length + ' entries');
         })().catch(function(e) {
             console.error('[vlfs] assets.zip load failed:', e);

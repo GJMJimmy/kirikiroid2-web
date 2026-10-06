@@ -181,6 +181,13 @@ private:
     std::atomic<bool> AsyncOpenPending;
     std::atomic<bool> AsyncStartPending;
     std::atomic<bool> AsyncFillPending;
+#ifdef KRKR2_WEB_NO_JSPI
+    // 无 JSPI 构建（Android WebView 99 / Chromium < 137）：Open 无法等待解码器
+    // 就绪，只能异步返回，因此必须记住"打开期间收到的 Play 请求"，待
+    // FinishOpenAsync 提交后再触发。JSPI 构建中 Open 会阻塞到提交完成，
+    // 脚本不可能在 AsyncOpenPending 为真时进入 Play，故不需要该字段。
+    std::atomic<bool> AsyncPlayPending;
+#endif
     struct tAsyncPlayContext;
     std::shared_ptr<tAsyncPlayContext> AsyncPlayContext;
 #endif

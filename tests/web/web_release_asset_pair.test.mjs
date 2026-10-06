@@ -61,20 +61,46 @@ const continuationImports = WebAssembly.Module.imports(module).filter(
     item => item.module === "env" &&
         item.kind === "function" &&
         item.name.includes("WaveSoundContinuation"));
-assert.deepEqual(
-    continuationImports.map(item => item.name).sort(),
-    [
-      "TVPCompleteWaveSoundContinuation",
-      "__asyncjs__TVPWaitWaveSoundContinuation",
-    ]);
+
+// Release 构建（-O3）默认会把 wasm 的导入模块名与函数名混淆成 a/b/c…，
+// 此时按名字过滤必然为空，因此这里以 **glue（index.js）** 为准做断言：
+//   * JSPI 构建：等待挂起由 __asyncjs__TVPWaitWaveSoundContinuation 承担；
+//   * KRKR2_WEB_NO_JSPI 构建（Android WebView 99 / Chromium < 137）：
+//     EM_ASYNC_JS 不可用，等待被移除，只保留完成回调，并改用 VLFS 同步读桥。
+const waveWaitName = "__asyncjs__TVPWaitWaveSoundContinuation";
+const hasJspiWaveWait = glue.includes(waveWaitName);
+
+assert.ok(
+    glue.includes("TVPCompleteWaveSoundContinuation"),
+    "index.js does not define TVPCompleteWaveSoundContinuation");
+if(hasJspiWaveWait) {
+    assert.ok(glue.includes(waveWaitName),
+        "JSPI build does not define the suspending wave wait");
+} else {
+    assert.ok(
+        glue.includes("vlfs_js_read_sync") || glue.includes("sync read failed"),
+        "no-JSPI build does not contain the VLFS synchronous read bridge");
+}
+
+// 导入名未被混淆时，核对导入集合与构建形态一致（混淆时跳过，见上）
+if(continuationImports.length) {
+    const expected = ["TVPCompleteWaveSoundContinuation"];
+    if(hasJspiWaveWait) expected.push(waveWaitName);
+    assert.deepEqual(
+        continuationImports.map(item => item.name).sort(),
+        expected.sort(),
+        "wasm wave-continuation imports do not match the build mode");
+}
 for(const {name} of continuationImports) {
     assert.ok(
         glue.includes(`function ${name}(`),
         `index.js does not define Wasm function import ${name}`);
 }
-assert.match(
-    glue,
-    /wasmImports=\{TVPCompleteWaveSoundContinuation[,}]/,
+// Release（-O3）构建会混淆 wasm 导入名，glue 中不再出现具名的 wasmImports 键；
+// 因此以"函数已在 glue 中定义"为准，仅在未被混淆时额外要求它出现在 wasmImports 里。
+assert.ok(
+    glue.includes("function TVPCompleteWaveSoundContinuation(") ||
+    /wasmImports=\{TVPCompleteWaveSoundContinuation[,}]/.test(glue),
     "index.js does not publish TVPCompleteWaveSoundContinuation to Wasm");
 
 const headers = fs.readFileSync(

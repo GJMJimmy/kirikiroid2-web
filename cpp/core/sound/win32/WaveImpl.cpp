@@ -62,6 +62,9 @@
 #include <fmt/printf.h>
 
 #ifdef __EMSCRIPTEN__
+// 无 JSPI 构建不定义本函数：没有可挂起的调用点（见 Open/Play 的
+// KRKR2_WEB_NO_JSPI 分支），且 EM_ASYNC_JS 本身需要 JSPI 或 Asyncify。
+#ifndef KRKR2_WEB_NO_JSPI
 EM_ASYNC_JS(void, TVPWaitWaveSoundContinuation, (uintptr_t token), {
     var waits = globalThis.__tvpWaveSoundContinuationWaits;
     if (!waits) {
@@ -82,6 +85,7 @@ EM_ASYNC_JS(void, TVPWaitWaveSoundContinuation, (uintptr_t token), {
     });
     waits.delete(token);
 });
+#endif // !KRKR2_WEB_NO_JSPI
 
 EM_JS(void, TVPCompleteWaveSoundContinuation, (uintptr_t token), {
     var waits = globalThis.__tvpWaveSoundContinuationWaits;
@@ -3369,6 +3373,21 @@ void tTJSNI_WaveSoundBuffer::CompleteStartPlayAsync(
     context->Error = error;
     if(!context->Active && AsyncPlayContext == context)
         AsyncPlayContext.reset();
+#ifdef KRKR2_WEB_NO_JSPI
+    // 无 JSPI：没有等待者来发布状态与清理状态机，改为在此提交。
+    // JSPI 版本由 Play() 在挂起返回后执行 AsyncStartPending=false /
+    // AsyncPlayContext.reset() / SetStatus；若不在此清理，AsyncStartPending
+    // 会恒为真，之后任何 Play() 都会早退（BGM 无法再次播放）。
+    // 错误同样无法回抛给 TJS 调用者——那属于同步语义——只能记日志。
+    if(context->Active) {
+        AsyncStartPending = false;
+        AsyncPlayContext.reset();
+        SetStatus(context->Started ? ssPlay : ssStop);
+    } else if(context->Error) {
+        TVPAddImportantLog(
+            ttstr(TJS_W("(error) asynchronous wave start failed")));
+    }
+#endif
     TVPCompleteWaveSoundContinuation(
         reinterpret_cast<uintptr_t>(context.get()));
 }
@@ -3396,11 +3415,28 @@ void tTJSNI_WaveSoundBuffer::StopPlay() {
 void tTJSNI_WaveSoundBuffer::Play() {
     // play from first or current position
 #ifdef __EMSCRIPTEN__
+#ifdef KRKR2_WEB_NO_JSPI
+    // 无 JSPI：Open 已异步返回，脚本通常紧接着调用 Play，必须记住该请求
+    // （由 FinishOpenAsync 在解码器提交后触发），否则 BGM 会被静默丢弃。
+    // 同时必须**立即**发布 ssPlay：四参考共同的脚本可观察契约是"Play 接受播放
+    // 请求后、返回 TJS 之前 status == 'play'"（见 analysis/
+    // wavesoundbuffer_web_async_status_four_binary_2026-08-30.md 的修复要求 1）。
+    // 若不发布，KAG 的 `sysvoice ... wait` 之类会在 open();play();status 序列上
+    // 读到 unload/stop 而不进入等待，导致语音重叠。
+    // 真正的设备启动完成由 CompleteStartPlayAsync 幂等收敛；首次填充失败时
+    // 该函数发布 ssStop，保证已等待 play -> stop 的 conductor 不会永久挂起。
+    if(AsyncOpenPending) {
+        AsyncPlayPending = true;
+        SetStatus(ssPlay);
+        return;
+    }
+#else
     // A serialized TJS caller cannot reach this branch: Open does not return
     // while its VLFS continuation is pending. Keep re-entrant browser events
     // from publishing a status that the native implementations never expose.
     if(AsyncOpenPending)
         return;
+#endif
 #endif
     if(!Decoder)
         return;
@@ -3419,6 +3455,16 @@ void tTJSNI_WaveSoundBuffer::Play() {
     // No BufferCS/L2BufferCS lock crosses this JSPI suspension. The async
     // continuations fill and start the device using short native critical
     // sections, then resume this original TJS call frame.
+#ifdef KRKR2_WEB_NO_JSPI
+    // 无 JSPI：不能等待设备启动完成的 continuation，本调用立即返回；但状态
+    // 必须在此**立即**发布，理由同上面的排队分支（四参考契约：Play 返回 TJS
+    // 之前 status 即为 'play'，见 analysis/wavesoundbuffer_web_async_status_
+    // four_binary_2026-08-30.md 的修复要求 2）。
+    // 之后由 CompleteStartPlayAsync 做幂等收敛：真正启动成功再发布一次 ssPlay
+    // （不产生新事件），首次填充失败则发布 ssStop 释放等待者。
+    SetStatus(ssPlay);
+    return;
+#else
     TVPWaitWaveSoundContinuation(
         reinterpret_cast<uintptr_t>(context.get()));
     if(AsyncPlayContext == context) {
@@ -3429,6 +3475,7 @@ void tTJSNI_WaveSoundBuffer::Play() {
         std::rethrow_exception(context->Error);
     if(context->Active)
         SetStatus(context->Started ? ssPlay : ssStop);
+#endif
 #else
 
     StopPlay();
@@ -3642,10 +3689,42 @@ void tTJSNI_WaveSoundBuffer::FinishOpenAsync(
     context->Active = active;
     context->Error = active ? error : nullptr;
 
+#ifdef KRKR2_WEB_NO_JSPI
+    // 无 JSPI：没有等待者，Open() 已立即返回，因此必须在此提交状态机——
+    // 对应 JSPI 版本中"等待返回后由 Open() 执行"的那几步——并处理打开期间
+    // 收到的延时 Play 请求。
+    // 平台边界：四个参考二进制的 Open 是同步的；WebView 99（Chromium < 137）
+    // 没有 JSPI，主线程无法同步等待异步解码器创建，只能退化为异步语义。
+    if(active && error) {
+        Clear();
+        TVPAddImportantLog(
+            ttstr(TJS_W("(error) asynchronous wave open failed: ")) +
+            context->StorageName);
+    } else if(active) {
+        const bool play = AsyncPlayPending;
+        AsyncOpenPending = false;
+        AsyncPlayPending = false;
+        if(play)
+            Play();
+        else
+            SetStatus(ssStop);
+    }
+#endif
+
     context->Decoder.reset();
     context->SliStream.reset();
+#ifdef KRKR2_WEB_NO_JSPI
+    // JSPI 版本由 Open() 的 tKeepAliveGuard 释放；无 JSPI 时 Open 已返回，
+    // 所有权在此交接。
+    if(context->KeepAlive) {
+        iTJSDispatch2 *keepAlive = context->KeepAlive;
+        context->KeepAlive = nullptr;
+        keepAlive->Release();
+    }
+#else
     TVPCompleteWaveSoundContinuation(
         reinterpret_cast<uintptr_t>(context.get()));
+#endif
 }
 #endif
 
@@ -3666,6 +3745,9 @@ void tTJSNI_WaveSoundBuffer::Open(const ttstr &storagename) {
     if(context->KeepAlive)
         context->KeepAlive->AddRef();
     AsyncOpenPending = true;
+#ifdef KRKR2_WEB_NO_JSPI
+    AsyncPlayPending = false;
+#endif
 
     TVPCreateWaveDecoderAsync(
         storagename,
@@ -3675,6 +3757,15 @@ void tTJSNI_WaveSoundBuffer::Open(const ttstr &storagename) {
                 CompleteOpenAsync(context, decoder, error);
             });
         });
+#ifdef KRKR2_WEB_NO_JSPI
+    // 无 JSPI：不能等待解码器 / filter chain / SLI 元数据全部提交，立即返回并
+    // 保持 AsyncOpenPending=true；FinishOpenAsync 负责提交状态机、释放
+    // KeepAlive，并在脚本已请求播放时触发延时 Play。
+    // 平台边界：参考实现的 Open 在返回时 Decoder/InputFormat 已就绪；WebView 99
+    // （Chromium < 137，无 JSPI）无法让主线程同步等待异步解码器创建，只能退化
+    // 为异步——TJS 侧在提交前会观察到"尚未打开"。
+    return;
+#else
     // The storage and decoder remain promise-backed, but the TJS call keeps
     // the native Open ordering: it resumes only after the decoder, filter
     // format and optional SLI metadata have all been committed. No sound
@@ -3699,6 +3790,7 @@ void tTJSNI_WaveSoundBuffer::Open(const ttstr &storagename) {
         std::rethrow_exception(error);
     }
     SetStatus(ssStop);
+#endif
 #else
 
     Decoder = TVPCreateWaveDecoder(storagename);

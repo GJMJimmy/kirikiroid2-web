@@ -18,7 +18,19 @@ addToLibrary({
     '$setMainLoop', '$MainLoop', '$handleException'
   ],
   emscripten_set_main_loop_arg: (func, arg, fps, simulateInfiniteLoop) => {
-    var wrappedTick = WebAssembly.promising(wasmTable.get(func));
+    // 运行期判别 JSPI 可用性，使同一份 JS 同时服务两种构建：
+    //   * 有 JSPI（Chromium 137+）：维持原有行为——包 promising + Promise 门控调度器。
+    //   * 无 JSPI（Android WebView 99 / Chromium < 137，见 KRKR2_WEB_NO_JSPI）：
+    //     WebAssembly.promising 不存在，不能包；且 tick 本身同步返回，
+    //     "挂起期间重叠 RAF" 的问题不存在，只保留 fps 限帧与 RAF 时间戳包装。
+    //     实测环境：Chromium 99.0.4844.0（webview99-port-plan.md §5.1）。
+    var jspiAvailable = (typeof WebAssembly.promising === 'function');
+    // func 是 wasm 函数表中的索引，必须先取回真正的函数对象再调用；
+    // 只有 JSPI 构建才需要（且必须）再包一层 promising。
+    var tickFunction = wasmTable.get(func);
+    var wrappedTick = jspiAvailable
+        ? WebAssembly.promising(tickFunction)
+        : tickFunction;
     // Emscripten's stock MainLoop.runIter intentionally discards the callback
     // return value and schedules the next RAF immediately. A JSPI export,
     // however, returns a Promise whenever its Wasm stack can suspend. Keep the
@@ -102,7 +114,7 @@ addToLibrary({
     };
     setMainLoop(iterFunc, fps, simulateInfiniteLoop, arg);
 
-    if (!promiseState.wrapper) {
+    if (jspiAvailable && !promiseState.wrapper) {
       promiseState.target = MainLoop.scheduler;
       promiseState.wrapper = () => {
         var pending = promiseState.pending;

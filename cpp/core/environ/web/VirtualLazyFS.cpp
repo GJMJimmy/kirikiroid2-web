@@ -95,6 +95,17 @@ EM_JS(double, vlfs_js_seek, (int fd, double offset, int whence), {
 EM_JS(double, vlfs_js_size, (int fd), { return VLFS.sizeOf(fd); });
 
 // FSA 懒元数据补全（罕见路径）
+#ifdef KRKR2_WEB_NO_JSPI
+// 无 JSPI（Android WebView 99 / Chromium < 137）：主线程无法等待 Promise，
+// 因此只能返回已同步可知的尺寸。远端 HTTP/WebDAV 源在注册时已从
+// Content-Length 得到尺寸，FSA 懒元数据在无 JSPI 构建下不可用（返回 -1，
+// 由调用方按失败处理；worker 侧仍走 vlfs_js_ensure_size_proxied 的异步代理）。
+EM_JS(double, vlfs_js_ensure_size_sync, (int fd), {
+    var f = VLFS._fds.get(fd);
+    if (!f) return -1;
+    return f.entry.size;
+});
+#else
 EM_ASYNC_JS(double, vlfs_js_ensure_size_await, (int fd), {
     var f = VLFS._fds.get(fd);
     if (!f) return -1;
@@ -104,6 +115,7 @@ EM_ASYNC_JS(double, vlfs_js_ensure_size_await, (int fd), {
     }
     return f.entry.size;
 });
+#endif
 
 EM_JS(int, vlfs_js_write, (int fd, const void *buf, int len), {
     return VLFS.write(fd, HEAPU8.subarray(buf, buf + len));
@@ -118,6 +130,24 @@ EM_JS(int, vlfs_js_read_cached, (int fd, void *buf, int len), {
 });
 
 // JSPI 挂起读（仅主线程、且调用栈源自 promising 导出时合法）
+#ifdef KRKR2_WEB_NO_JSPI
+// 无 JSPI：主线程读必须同步完成。vlfs.js 的 readSync 用同步 XHR 供数，
+// 因此仅 HTTP / WebDAV 源可用（Blob / File System Access / ZIP 条目在主线程
+// 没有同步读手段：FileReaderSync 仅 worker 可用，Blob.slice 只能是异步的）。
+// 其它源会返回 -1 并把可读原因打到控制台。
+// 二进制解码注意：主线程同步 XHR 不允许 responseType='arraybuffer'，只能用
+// charset=x-user-defined + charCodeAt(i) & 0xFF（见 vlfs.js readSync 注释）。
+EM_JS(int, vlfs_js_read_sync, (int fd, void *buf, int len), {
+    try {
+        var data = VLFS.readSync(fd, len);
+        HEAPU8.set(data, buf);
+        return data.length;
+    } catch (e) {
+        console.error('[vlfs] sync read failed:', e);
+        return -1;
+    }
+});
+#else
 EM_ASYNC_JS(int, vlfs_js_read_await, (int fd, void *buf, int len), {
     try {
         var data = await VLFS.read(fd, len);
@@ -130,6 +160,24 @@ EM_ASYNC_JS(int, vlfs_js_read_await, (int fd, void *buf, int len), {
         return -1;
     }
 });
+#endif
+
+// 供 Size()/Read() 调用：按构建形态选择挂起或同步实现。
+static double EnsureSizeOnMain(int fd) {
+#ifdef KRKR2_WEB_NO_JSPI
+    return vlfs_js_ensure_size_sync(fd);
+#else
+    return vlfs_js_ensure_size_await(fd);
+#endif
+}
+
+static int ReadOnMain(int fd, void *buf, int len) {
+#ifdef KRKR2_WEB_NO_JSPI
+    return vlfs_js_read_sync(fd, buf, len);
+#else
+    return vlfs_js_read_await(fd, buf, len);
+#endif
+}
 
 // 真正的 callback 异步读：即使块缓存命中也经 Promise microtask 完成，
 // 从而保证 C++ completion 永不内联。Promise 始终在主线程完成；上层流
@@ -396,7 +444,7 @@ int64_t Size(int fd) {
     double r;
     if (OnMain()) {
         r = vlfs_js_size(fd);
-        if (r < 0) r = vlfs_js_ensure_size_await(fd);
+        if (r < 0) r = EnsureSizeOnMain(fd);
         return (int64_t)r;
     }
     RunOnMainSync([&] { r = vlfs_js_size(fd); });
@@ -411,7 +459,7 @@ int Read(int fd, void *buf, int len) {
     if (OnMain()) {
         int n = vlfs_js_read_cached(fd, buf, len);
         if (n >= 0) return n;
-        return vlfs_js_read_await(fd, buf, len);
+        return ReadOnMain(fd, buf, len);
     }
     ProxiedReadReq req{ fd, buf, len, -1 };
     if (!emscripten_proxy_sync_with_ctx(Queue(), MainThread(), ProxiedReadTask,

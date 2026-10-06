@@ -678,8 +678,14 @@
          * 返回 { paths, xp3Paths }。
          */
         async registerZipBlob(blob, opts) {
-            return this._registerZipSource(
-                { kind: 'blob', size: blob.size, blob: blob }, opts);
+            var source = { kind: 'blob', size: blob.size, blob: blob };
+            // materialize：把整包读进 JS 堆的 Uint8Array，使条目可以**同步**切片
+            // （无 JSPI 构建的主线程唯一可行的归档来源）。仅适用于小体积资源包
+            // （例如 UI 资源 assets.zip）；大体积游戏包请用 XP3 + 远端 Range。
+            if (opts && opts.materialize) {
+                source.bytes = new Uint8Array(await blob.arrayBuffer());
+            }
+            return this._registerZipSource(source, opts);
         },
 
         async registerZipRemote(url, size, opts) {
@@ -987,6 +993,195 @@
             f.pos += n2;
             this._statsHit++;
             return out2;
+        },
+
+        // ================= 同步读（无 JSPI 构建） =================
+        //
+        // 适用对象：Android WebView 99 / Chromium < 137（JSPI 要到 137 才有），
+        // 由 KRKR2_WEB_NO_JSPI 构建开启，主线程经 VirtualLazyFS.cpp 的
+        // EM_JS vlfs_js_read_sync 调用。
+        //
+        // 主线程没有任何"等待 Promise"的手段（Atomics.wait 在 Window 下抛异常，
+        // 已在 Chromium 99 实测），因此同步读只可能来自三类来源：
+        //   1) overlay 或已命中的块缓存（纯内存）；
+        //   2) HTTP(S) 同步 XHR + Range（远端 XP3 / WebDAV 散文件）；
+        //   3) 已物化到 JS 堆的归档字节（registerZipBlob 的 materialize 选项，
+        //      用于 assets.zip 这类小体积 UI 资源包）。
+        // Blob / File System Access / deflate ZIP 条目在主线程**没有**同步读手段
+        // （FileReaderSync 仅 worker 可用；Blob.slice().arrayBuffer() 与
+        // DecompressionStream 都是异步的），一律抛出可读错误。
+
+        // 已知尺寸直接返回；未知（FSA 懒元数据）返回 -1，由调用方按失败处理。
+        ensureSizeSync(fd) {
+            var f = this._fds.get(fd);
+            if (!f) return -1;
+            return f.entry.size;
+        },
+
+        readSync(fd, len) {
+            var f = this._fds.get(fd);
+            if (!f) throw new Error('vlfs: bad fd ' + fd);
+            var e = f.entry;
+            if (e.size >= 0 && f.pos >= e.size) return new Uint8Array(0);
+            if (e.kind === 'overlay') {
+                var n0 = Math.min(len, e.size - f.pos);
+                var out0 = e.data.subarray(f.pos, f.pos + n0);
+                f.pos += n0;
+                this._statsHit++;
+                return out0;
+            }
+            if (e.size < 0) {
+                throw new Error('vlfs: unknown size for ' + (e.path || '?') +
+                    ' (synchronous path needs a known size)');
+            }
+            var n = Math.min(len, e.size - f.pos);
+            if (n >= DIRECT_READ_THRESHOLD) {
+                // 大读直读源，不污染块缓存（与异步 read() 的语义一致）
+                this._statsMiss++;
+                var big = this._readSourceSync(e, f.pos, n);
+                f.pos += n;
+                return big;
+            }
+            // 小读/中读走块缓存。未命中时**同步补整块**而不是只取 len 字节：
+            // 引擎的典型模式是"先读几十字节的头，再读整段"，逐次发同步 XHR
+            // 会把每次小读都变成一次网络往返（0.1–1 ms/字节量级的浪费）。
+            var first = Math.floor(f.pos / BLOCK_SIZE);
+            var last = Math.floor((f.pos + n - 1) / BLOCK_SIZE);
+            var miss = false;
+            for (var b = first; b <= last; b++) {
+                if (!this._blockCache.has(e.id + '@' + b)) { miss = true; break; }
+            }
+            if (miss) {
+                this._statsMiss++;
+                for (var b2 = first; b2 <= last; b2++) {
+                    if (this._blockCache.has(e.id + '@' + b2)) continue;
+                    var off = b2 * BLOCK_SIZE;
+                    var blen = Math.min(BLOCK_SIZE, e.size - off);
+                    this._putBlock(e, b2, this._readSourceSync(e, off, blen));
+                }
+            } else {
+                this._statsHit++;
+            }
+            var out = new Uint8Array(n);
+            this._assembleFromBlocks(e, f.pos, out);
+            f.pos += n;
+            return out;
+        },
+
+        // 块写入 + 预算淘汰（同步与异步补块共用）
+        _putBlock(e, blockIdx, data) {
+            var key = e.id + '@' + blockIdx;
+            if (this._blockCache.has(key)) return;
+            this._blockCache.set(key, data);
+            this._blockCacheBytes += data.length;
+            while (this._blockCacheBytes > BLOCK_CACHE_BUDGET) {
+                var oldest = this._blockCache.keys().next().value;
+                this._blockCacheBytes -= this._blockCache.get(oldest).length;
+                this._blockCache.delete(oldest);
+            }
+        },
+
+        _readSourceSync(e, pos, len) {
+            switch (e.kind) {
+                case 'remote':
+                    return this._syncRange(e.url, pos, len, e.requestHeaders, null);
+                case 'zip': {
+                    if (e.method !== 0) {
+                        throw new Error('vlfs: deflate ZIP entry "' + (e.path || '?') +
+                            '" has no synchronous read path ' +
+                            "(DecompressionStream('deflate-raw') needs Chrome 103+); " +
+                            'repack as XP3 or a stored (uncompressed) ZIP');
+                    }
+                    if (e.dataOffset < 0) this._resolveZipDataOffsetSync(e);
+                    var src = e.zipSource;
+                    if (src.kind === 'blob') {
+                        if (!src.bytes) {
+                            throw new Error('vlfs: local ZIP source was not materialized; ' +
+                                'pass {materialize:true} to registerZipBlob to enable ' +
+                                'synchronous reads');
+                        }
+                        var from = e.dataOffset + pos;
+                        return src.bytes.slice(from, from + len);
+                    }
+                    return this._syncRange(src.url, e.dataOffset + pos, len, null, src.etag);
+                }
+                case 'blob':
+                case 'fsa':
+                    throw new Error('vlfs: entry kind "' + e.kind + '" (' + (e.path || '?') +
+                        ') has no synchronous read path on the main thread');
+                default:
+                    throw new Error('vlfs: unreadable entry kind ' + e.kind);
+            }
+        },
+
+        _resolveZipDataOffsetSync(e) {
+            var src = e.zipSource;
+            var hdrBytes;
+            if (src.kind === 'blob') {
+                if (!src.bytes) {
+                    throw new Error('vlfs: local ZIP source was not materialized');
+                }
+                hdrBytes = src.bytes.subarray(e.localHeaderOffset, e.localHeaderOffset + 30);
+            } else {
+                hdrBytes = this._syncRange(src.url, e.localHeaderOffset, 30, null, src.etag);
+            }
+            var hdr = new DataView(hdrBytes.buffer, hdrBytes.byteOffset, hdrBytes.byteLength);
+            if (hdr.getUint32(0, true) !== 0x04034b50) {
+                throw new Error('vlfs: bad zip local header @' + e.localHeaderOffset);
+            }
+            e.dataOffset = e.localHeaderOffset + 30 +
+                hdr.getUint16(26, true) + hdr.getUint16(28, true);
+        },
+
+        /*
+         * 同步 HTTP Range 读。
+         *
+         * 主线程的同步 XHR 不允许 responseType='arraybuffer'（规范：synchronous
+         * flag 且 global 为 Window → InvalidAccessError，Chromium 99 实测被拒），
+         * 因此必须 overrideMimeType('text/plain; charset=x-user-defined') 后经
+         * responseText 取二进制——漏掉 overrideMimeType 会按 UTF-8 解码而静默
+         * 损坏高字节。
+         *
+         * 关于 `& 0xFF`：Blink 按 WHATWG encoding 规范把 0x80–0xFF 映射到
+         * U+F780–U+F7FF，所以 charCodeAt 返回 0xF7xx 而不是原始字节。写进
+         * Uint8Array 时本就会按 8 位截断（0xF7FF → 0xFF，结果恰好正确），
+         * 这里显式掩码是为了让意图明确；**任何在 JS 里对该值做算术或比较的
+         * 地方都必须显式 `& 0xFF`**，否则会得到错误结果（Chromium 99 实测：
+         * M0 冒烟测试第一版正是因为没有掩码而在求和/末字节比较上出错）。
+         */
+        _syncRange(url, pos, len, extraHeaders, expectEtag) {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', url, false);
+            xhr.overrideMimeType('text/plain; charset=x-user-defined');
+            if (extraHeaders) {
+                for (var k in extraHeaders) {
+                    if (Object.prototype.hasOwnProperty.call(extraHeaders, k)) {
+                        xhr.setRequestHeader(k, extraHeaders[k]);
+                    }
+                }
+            }
+            xhr.setRequestHeader('Range', 'bytes=' + pos + '-' + (pos + len - 1));
+            xhr.send(null);
+            if (xhr.status === 200) {
+                throw new Error('vlfs: server ignored Range for ' + url +
+                    ' (synchronous path requires 206 Partial Content)');
+            }
+            if (xhr.status !== 206) {
+                throw new Error('vlfs: sync range ' + url + ' -> HTTP ' + xhr.status);
+            }
+            if (expectEtag) {
+                var got = (xhr.getResponseHeader('ETag') || '').trim();
+                if (got !== expectEtag) {
+                    throw new Error('vlfs: ZIP changed while reading ranges (sync)');
+                }
+            }
+            var text = xhr.responseText;
+            if (text.length < len) {
+                throw new Error('vlfs: short sync range ' + text.length + ' < ' + len);
+            }
+            var out = new Uint8Array(len);
+            for (var i = 0; i < len; i++) out[i] = text.charCodeAt(i) & 0xFF;
+            return out;
         },
 
         async read(fd, len) {
