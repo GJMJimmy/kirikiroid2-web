@@ -989,10 +989,10 @@
                 if (!this._blockCache.has(e.id + '@' + b)) { this._statsMiss++; return null; }
             }
             var out2 = new Uint8Array(n2);
-            this._assembleFromBlocks(e, f.pos, out2);
-            f.pos += n2;
+            var got2 = this._assembleFromBlocks(e, f.pos, out2);
+            f.pos += got2;
             this._statsHit++;
-            return out2;
+            return got2 === out2.length ? out2 : out2.subarray(0, got2);
         },
 
         // ================= 同步读（无 JSPI 构建） =================
@@ -1039,7 +1039,8 @@
                 // 大读直读源，不污染块缓存（与异步 read() 的语义一致）
                 this._statsMiss++;
                 var big = this._readSourceSync(e, f.pos, n);
-                f.pos += n;
+                // 短读时按**实际**长度推进：按请求长度推进会越过真实 EOF
+                f.pos += big.length;
                 return big;
             }
             // 小读/中读走块缓存。未命中时**同步补整块**而不是只取 len 字节：
@@ -1063,9 +1064,10 @@
                 this._statsHit++;
             }
             var out = new Uint8Array(n);
-            this._assembleFromBlocks(e, f.pos, out);
-            f.pos += n;
-            return out;
+            var got = this._assembleFromBlocks(e, f.pos, out);
+            // 源提前结束（短块）时只返回真实得到的字节
+            f.pos += got;
+            return got === out.length ? out : out.subarray(0, got);
         },
 
         // 块写入 + 预算淘汰（同步与异步补块共用）
@@ -1176,11 +1178,14 @@
                 }
             }
             var text = xhr.responseText;
-            if (text.length < len) {
-                throw new Error('vlfs: short sync range ' + text.length + ' < ' + len);
-            }
-            var out = new Uint8Array(len);
-            for (var i = 0; i < len; i++) out[i] = text.charCodeAt(i) & 0xFF;
+            // 短读是**合法**的：Range 越过 EOF 时服务端按 HTTP 语义只返回剩余字节
+            // （206 + 较短 body）。此处绝不能抛错——引擎会把读失败当成 I/O 错误，
+            // 进而中断场景（实测：标题能出图，一进游戏就 "sync read failed:
+            // short sync range 4783 < 9568" → worker 线程崩溃 → 黑屏卡死）。
+            // 调用方 readSync() 按返回长度推进文件位置。
+            var got = Math.min(text.length, len);
+            var out = new Uint8Array(got);
+            for (var i = 0; i < got; i++) out[i] = text.charCodeAt(i) & 0xFF;
             return out;
         },
 
@@ -1204,10 +1209,12 @@
                 var first = Math.floor(f.pos / BLOCK_SIZE);
                 var last = Math.floor((f.pos + n - 1) / BLOCK_SIZE);
                 for (var b = first; b <= last; b++) await this._ensureBlock(e, b);
-                out = new Uint8Array(n);
-                this._assembleFromBlocks(e, f.pos, out);
+                var tmp = new Uint8Array(n);
+                var gotB = this._assembleFromBlocks(e, f.pos, tmp);
+                out = gotB === tmp.length ? tmp : tmp.subarray(0, gotB);
             }
-            f.pos += n;
+            // 短读（数据源提前结束）时按**实际**长度推进，避免越过真实 EOF
+            f.pos += out.length;
             return out;
         },
 
@@ -1217,15 +1224,20 @@
             var done = 0;
             while (done < out.length) {
                 var b = Math.floor((pos + done) / BLOCK_SIZE);
-                var block = this._blockCache.get(e.id + '@' + b);
+                var key = e.id + '@' + b;
+                var block = this._blockCache.get(key);
+                if (!block) break;  // 缺块：按短读返回，交给调用方推进位置
                 // LRU touch
-                this._blockCache.delete(e.id + '@' + b);
-                this._blockCache.set(e.id + '@' + b, block);
+                this._blockCache.delete(key);
+                this._blockCache.set(key, block);
                 var off = (pos + done) - b * BLOCK_SIZE;
                 var n = Math.min(out.length - done, block.length - off);
+                // 源提前结束（短块）时 n 会变成 0；必须 break，否则 done 不前进 → 死循环
+                if (n <= 0) break;
                 out.set(block.subarray(off, off + n), done);
                 done += n;
             }
+            return done;
         },
 
         async _ensureBlock(e, blockIdx) {

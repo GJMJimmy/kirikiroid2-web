@@ -147,7 +147,10 @@ elseif(WEB)
     # KRKR2_WEB_NO_JSPI：无 JSPI 时 pthread_create 无法等待 Worker 冷启动，
     # 必须预建池（默认 8），否则线程创建会失败。
     if(KRKR2_WEB_NO_JSPI)
-        set(KRKR2_WEB_PTHREAD_POOL_SIZE_DEFAULT "8")
+        # 实测：进游戏后引擎创建的 pthread 数远超 32；池不够时按需新建的 Worker
+        # 在无 JSPI 下会以 "table index is out of bounds" 崩溃（上游用 JSPI 的
+        # pthread_jspi.js 等 Worker 就绪，此构建没有该手段）。池=64 时全部归零。
+        set(KRKR2_WEB_PTHREAD_POOL_SIZE_DEFAULT "64")
     else()
         set(KRKR2_WEB_PTHREAD_POOL_SIZE_DEFAULT "0")
     endif()
@@ -173,6 +176,11 @@ elseif(WEB)
         "SHELL:-s FORCE_FILESYSTEM=1"
         "SHELL:-s EXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
         "SHELL:-s PTHREAD_POOL_SIZE=${KRKR2_WEB_PTHREAD_POOL_SIZE}"
+        # 无 JSPI 构建必须允许池满后按需新建 Worker：引擎在进入游戏后会创建的线程
+        # 数超过任何合理预建池（实测 32 仍被耗尽），而默认的 STRICT 语义在池满时
+        # 直接让 pthread_create 失败——后果是引擎该线程负责的工作（背景/立绘等资源
+        # 处理）静默不完成。STRICT=0 = 池满不报错，退回按需创建。
+        "SHELL:-s PTHREAD_POOL_SIZE_STRICT=0"
         "SHELL:-s DEFAULT_PTHREAD_STACK_SIZE=1048576"
         # VirtualLazyFS: 主线程文件读经 JSPI 挂起等待 JS 异步供数
         # （Chromium 137+ / WebKit 26.4+，即 Safari 27 beta；EM_ASYNC_JS 导入

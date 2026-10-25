@@ -74,13 +74,27 @@ self.addEventListener('fetch', function (event) {
         return;
     }
 
+    /* Range requests (game archives read synchronously through VLFS) must reach
+     * the origin untouched:
+     *   1. the response is 206 Partial Content, which Cache API refuses to store
+     *      ("Partial response (status code 206) is unsupported");
+     *   2. cache-first matching ignores the Range header, so a previously cached
+     *      200 would be served for a Range read — VLFS would then receive a full
+     *      body where it expects a slice. */
+    if (request.headers.get('range')) {
+        event.respondWith(fetch(request));
+        return;
+    }
+
     /* Navigation requests (HTML): network-first so updates propagate quickly,
      * but fall back to cache for offline access. */
     if (request.mode === 'navigate') {
         event.respondWith(
             fetch(request).then(function (response) {
-                var clone = response.clone();
-                caches.open(CACHE_NAME).then(function (cache) { cache.put(request, clone); });
+                if (response.status === 200) {
+                    var clone = response.clone();
+                    caches.open(CACHE_NAME).then(function (cache) { cache.put(request, clone); });
+                }
                 return response;
             }).catch(function () {
                 return caches.match(request).then(function (cached) {
@@ -105,7 +119,8 @@ self.addEventListener('fetch', function (event) {
             caches.match(request).then(function (cached) {
                 if (cached) return cached;
                 return fetch(request).then(function (response) {
-                    if (response.ok) {
+                    /* 只缓存完整响应：206 部分响应与 opaque 响应都不能进 CacheStorage */
+                    if (response.ok && response.status === 200) {
                         var clone = response.clone();
                         caches.open(CACHE_NAME).then(function (cache) { cache.put(request, clone); });
                     }

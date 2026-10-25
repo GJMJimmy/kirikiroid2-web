@@ -3903,6 +3903,16 @@ tjs_uint64 tTJSNI_WaveSoundBuffer::GetPosition() {
         return 0L;
     if(!SoundBuffer)
         return 0L;
+    // 平台边界（见 Open 的 KRKR2_WEB_NO_JSPI 分支注释）：无 JSPI 构建的 Open 异步
+    // 返回，异步提交前 InputFormat 尚未建立（SamplesPerSec == 0），此时脚本可以
+    // 观察到"尚未打开"状态并读到该属性。
+    // 四个参考二进制都是 ARM（arm64-v8a / armeabi-v7a / iOS arm64 / armv7）：ARM 的
+    // 整数除零**返回 0**（UDIV/SDIV by zero = 0），而 wasm 的 i32.div_s 会**陷阱**。
+    // 这里显式返回 0，复刻参考平台上脚本实际观察到的结果；不加守卫会变成 wasm 陷阱
+    // 并打断引擎主循环（实测：游戏播语音时脚本读 totalTime → divide by zero →
+    // 画面永久冻结）。
+    if(InputFormat.SamplesPerSec == 0)
+        return 0L;
 
     return GetSamplePosition() * 1000 / InputFormat.SamplesPerSec;
 }
@@ -3914,6 +3924,11 @@ void tTJSNI_WaveSoundBuffer::SetPosition(tjs_uint64 pos) {
 
 //---------------------------------------------------------------------------
 tjs_uint64 tTJSNI_WaveSoundBuffer::GetTotalTime() {
+    // 平台边界：同 GetPosition()。未打开时返回 0——ARM 的整数除零结果就是 0，
+    // wasm 会陷阱，显式返回 0 与参考平台的可观察结果一致。
+    if(InputFormat.SamplesPerSec == 0)
+        return 0L;
+
     return InputFormat.TotalSamples * 1000 / InputFormat.SamplesPerSec;
 }
 

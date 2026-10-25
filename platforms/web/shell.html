@@ -83,7 +83,8 @@
                 var params = new URLSearchParams(window.location.search);
                 // Auto-load mode (?xp3= / ?game= / ?webdavUrl=): hide the static landing content
                 // before first paint; the loading overlay takes over instead.
-                if (params.get('xp3') || params.get('game') || params.get('webdavUrl')) {
+                if (params.get('xp3') || params.get('game') || params.get('webdavUrl') ||
+                    params.get('remote')) {
                     document.documentElement.classList.add('krkr2-autoload');
                 }
                 if (params.get('debugEarlyLogs') === '1') {
@@ -860,6 +861,8 @@
         }
         var gameFileReady = false;
         var userFileDepAdded = false;
+        var pendingRunDeps = {};
+        var runtimeReady = false;
         var hasFileSystemAPI = typeof window.showDirectoryPicker === 'function';
 
         // --- Web 平台边界：同一 origin 只允许一个活跃引擎实例 ---
@@ -1210,9 +1213,25 @@
             preRun: [function() {
                 FS.mkdir('/savedata');
                 applyRendererPreferenceFromUrl();
+                // 依赖追踪（诊断用）：Emscripten 只把剩余数量给到
+                // monitorRunDependencies，不告诉你是谁没归零。这里包裹加/减函数
+                // 维护一份待决集合，卡住时能直接看到是哪个依赖。
+                pendingRunDeps = {};
+                var _addDep = Module.addRunDependency;
+                var _removeDep = Module.removeRunDependency;
+                Module.addRunDependency = function(id) {
+                    pendingRunDeps[id] = true;
+                    return _addDep.apply(Module, arguments);
+                };
+                Module.removeRunDependency = function(id) {
+                    delete pendingRunDeps[id];
+                    return _removeDep.apply(Module, arguments);
+                };
                 Module.addRunDependency('engine-singleton');
                 engineSingletonReady.then(function(acquired) {
                     if (acquired) Module.removeRunDependency('engine-singleton');
+                    else console.log('[boot] engine-singleton not acquired ' +
+                        '(another tab owns the engine?); dependency stays pending');
                 });
                 Module.addRunDependency('user-file');
                 userFileDepAdded = true;
@@ -1228,6 +1247,11 @@
             postRun: [function() {
                 loadingOverlay.classList.add('hidden');
             }],
+            onRuntimeInitialized: function() {
+                // 引擎运行时已就绪：此后残留的运行依赖（例如 engine-singleton
+                // 在多标签场景下有意保留）不再代表"启动失败"。
+                runtimeReady = true;
+            },
             print: function(text) { console.log(text); },
             printErr: function(text) { console.error(text); },
             canvas: (function() {
@@ -1241,7 +1265,8 @@
             setStatus: function(text) {
                 if (!text) {
                     loadingOverlay.classList.add('hidden');
-                    if (!gameFileReady && !xp3Url && !gameZipUrl && !webdavUrl) {
+                    if (!gameFileReady && !xp3Url && !gameZipUrl && !webdavUrl &&
+                        !remoteFiles.length) {
                         showFilePicker();
                     }
                     return;
@@ -1278,8 +1303,58 @@
                 } else {
                     Module.setStatus('Starting... (' + left + ' remaining)');
                 }
+                if (left > 0) scheduleBootProbe(left);
             }
         };
+
+        // 启动卡住时的自诊断：**仅当引擎运行时确实没起来**（onRuntimeInitialized
+        // 未触发）且运行依赖长时间不归零时才报警。引擎已运行时的残留依赖
+        // （如多标签下的 engine-singleton）是正常状态，不能遮住画面。
+        var bootProbeTimer = null;
+        var bootProbeLeft = 0;
+        function scheduleBootProbe(left) {
+            bootProbeLeft = left;
+            if (bootProbeTimer) return;
+            bootProbeTimer = setTimeout(function() {
+                bootProbeTimer = null;
+                if (bootProbeLeft === 0 || runtimeReady) {
+                    if (bootProbeLeft > 0) {
+                        console.log('[boot] engine running; pending run deps: ' +
+                            Object.keys(pendingRunDeps).join(','));
+                    }
+                    return;
+                }
+                var targets = ['index.wasm', 'index.js', 'assets.zip'];
+                var lines = ['启动停滞：引擎未就绪，还有 ' + bootProbeLeft + ' 项资源依赖。'];
+                lines.push('待决依赖: ' + (Object.keys(pendingRunDeps).join(', ') || '(未知)'));
+                lines.push('');
+                var done = 0;
+                targets.forEach(function(name) {
+                    var url = './' + name + (window.__krkr2VersionQuery || '');
+                    fetch(url, { method: 'HEAD', cache: 'no-store' }).then(function(r) {
+                        lines.push(name + ' -> ' + r.status + ' ' +
+                            (r.headers.get('content-type') || '?') +
+                            ' length=' + (r.headers.get('content-length') || '?'));
+                    }).catch(function(e) {
+                        lines.push(name + ' -> 请求失败: ' + e.message);
+                    }).then(function() {
+                        if (++done < targets.length) return;
+                        lines.push('');
+                        lines.push('常见原因：');
+                        lines.push('· index.wasm 未上传完整或被防火墙/WAF 拦截');
+                        lines.push('· .wasm 未配置 application/wasm 且服务器压缩导致流式编译挂起');
+                        lines.push('· 服务器不支持 Range / 大文件被限速或中断');
+                        lines.push('请在 Network 面板确认 index.wasm 的最终状态与大小（应约 21.7 MB）。');
+                        var el = document.getElementById('error-message');
+                        document.getElementById('error-overlay').classList.add('visible');
+                        el.textContent = lines.join('\n');
+                        el.style.whiteSpace = 'pre-wrap';
+                        el.style.textAlign = 'left';
+                        console.log('[boot-probe] ' + lines.join(' | '));
+                    });
+                });
+            }, 12000);
+        }
 
         Module.setStatus('Downloading engine...');
 
@@ -1314,7 +1389,24 @@
 
         var searchUrlParams = new URLSearchParams(window.location.search);
         var urlParams = searchUrlParams;
-        var xp3Url = urlParams.get('xp3');
+        // ?xp3= 支持**多个**归档：重复参数（?xp3=a&xp3=b）或逗号分隔（?xp3=a,b）。
+        // 多归档游戏（data.xp3 + patch.xp3 + bgm.xp3 + voice.xp3 …）需要每个包都以
+        // 原名出现在 VLFS 根目录：引擎只从 /data.xp3 启动，其余由游戏脚本用
+        // Storages.isExistentStorage/addAutoPath 按名字挂载。ZIP（?game=）路径在
+        // 无 JSPI 构建下不可用（FSA 句柄没有同步读），所以多包必须这样注册。
+        var xp3Urls = urlParams.getAll('xp3').reduce(function(acc, value) {
+            return acc.concat(String(value).split(',').map(function(s) {
+                return s.trim();
+            }).filter(function(s) { return s.length > 0; }));
+        }, []);
+        var xp3Url = xp3Urls.length ? xp3Urls[0] : null;
+        // ?remote=<vpath>@<url>（可重复/逗号分隔）：注册散装游戏文件，例如
+        //   ?remote=/patch.tjs@patch.tjs
+        var remoteFiles = urlParams.getAll('remote').reduce(function(acc, value) {
+            return acc.concat(String(value).split(',').map(function(s) {
+                return s.trim();
+            }).filter(function(s) { return s.length > 0; }));
+        }, []);
         var gameZipUrl = urlParams.get('game');
         var webdavUrl = urlParams.get('webdavUrl');
         var entryXp3 = urlParams.get('entry');
@@ -1496,8 +1588,7 @@
         function idbUnregisterSpace(name) {
             try {
                 var saved = JSON.parse(localStorage.getItem('krkr2-spaces') || '[]');
-                saved = saved.filter(function(s) { return s !== name; });
-                localStorage.setItem('krkr2-spaces', JSON.stringify(saved));
+                saved = saved.filter(function(s) { return s !== name; });                localStorage.setItem('krkr2-spaces', JSON.stringify(saved));
             } catch (e) {}
         }
 
@@ -1530,6 +1621,36 @@
                 };
                 req.onerror = function() { resolve({ count: 0, size: 0 }); };
             });
+        }
+
+        // 默认存档空间：按游戏自动启用，使存档**默认**就能持久化。
+        // 存储用 IndexedDB（不用 OPFS）：老设备/旧 WebView 普遍没有 OPFS，而
+        // IndexedDB 从 2012 年起就可用。空间 ID 按 xp3 列表散列，避免多游戏串档。
+        function defaultSaveSpaceId() {
+            var key;
+            try {
+                key = (typeof xp3Urls !== 'undefined' && xp3Urls.length)
+                    ? xp3Urls.join('|')
+                    : (location.pathname + '|' + (document.title || ''));
+            } catch (e) {
+                key = location.pathname + '|';
+            }
+            var h = 5381;
+            for (var i = 0; i < key.length; i++) h = ((h * 33) ^ key.charCodeAt(i)) >>> 0;
+            return 'auto-' + h.toString(16) + '_' + (key.length & 0xffff).toString(16);
+        }
+        async function ensureDefaultSaveSpace() {
+            if (Module._saveSpaceId) return;
+            var id = defaultSaveSpaceId();
+            Module._saveSpaceId = id;
+            try { localStorage.setItem('krkr2-last-space', id); } catch (e) {}
+            try {
+                await idbOpen(id);
+                idbRegisterSpace(id);
+                console.log('[IDB] save space enabled: ' + id);
+            } catch (e) {
+                console.warn('[IDB] save space open failed: ' + id + ' - ' + e.message);
+            }
         }
 
         async function idbRestoreSaves() {
@@ -1804,12 +1925,21 @@
             }
         }
 
-        function startGame() {
+        async function startGame() {
             gameFileReady = true;
             filePicker.classList.remove('visible');
             loadingOverlay.classList.remove('hidden');
             statusElement.textContent = 'Starting game...';
             progressFill.style.width = '100%';
+
+            // 存档默认持久化（IndexedDB，不用 OPFS）：先确保有一个按游戏区分的
+            // 存档空间；否则 idbRestoreSaves 与写入钩子都会因为 _saveSpaceId
+            // 为空而静默跳过（这就是"每次重开都没有存档"的原因）。
+            try {
+                await ensureDefaultSaveSpace();
+            } catch (e) {
+                console.warn('[IDB] ensureDefaultSaveSpace failed:', e);
+            }
 
             function releaseDep() {
                 if (userFileDepAdded) Module.removeRunDependency('user-file');
@@ -1895,44 +2025,74 @@
             };
         }
 
-        // ?xp3=：优先 HTTP Range 懒加载；服务器不支持时整包 Blob（仍 off-heap）
-        async function fetchXp3FromUrl(url) {
+        // 注册一个远程文件：优先 HTTP Range 懒加载（不下载整包），服务端不支持 Range 时
+        // 退化为整包 Blob（仍 off-heap）。
+        async function registerRemotePath(vpath, url) {
+            var ranges = false, size = -1;
+            try {
+                var head = await fetch(url, { method: 'HEAD' });
+                if (head.ok) {
+                    ranges = (head.headers.get('Accept-Ranges') || '').toLowerCase() === 'bytes';
+                    size = parseInt(head.headers.get('Content-Length') || '-1', 10);
+                }
+            } catch (e) {}
+
+            if (ranges && size > 0) {
+                VLFS.registerRemote(vpath, url, size, true);
+                console.log('[vlfs] remote (Range): ' + vpath +
+                    ' <- ' + url + ', ' + size + ' bytes');
+            } else {
+                statusElement.textContent = 'Downloading ' + vpath + '...';
+                var blob = await fetchBlobWithProgress(url, function(loaded, total) {
+                    if (total > 0) {
+                        var pct = Math.round(loaded / total * 100);
+                        progressFill.style.width = pct + '%';
+                        statusElement.textContent = 'Downloading ' + vpath + '... ' + pct + '%';
+                    } else {
+                        statusElement.textContent = 'Downloading ' + vpath + '... ' +
+                            (loaded / 1048576).toFixed(1) + ' MB';
+                    }
+                });
+                VLFS.registerBlobFile(vpath, blob);
+                console.log('[vlfs] remote (blob): ' + vpath + ', ' + blob.size + ' bytes');
+            }
+        }
+
+        // 多文件远程游戏：
+        //   ?xp3=/data.xp3&xp3=/patch.xp3&…（或逗号分隔）：XP3 归档，注册成**原本的
+        //     文件名**，因为游戏脚本用 Storages.isExistentStorage/addAutoPath 按名字
+        //     探测与挂载兄弟包；引擎自身只从 /data.xp3 启动（见 Platform.cpp
+        //     TVPCheckStartupArg：同级 xp3 的挂载顺序必须完全由游戏脚本决定）。
+        //   ?remote=/patch.tjs@patch.tjs：散装文件（引擎会直接按 app 路径读取，
+        //     例如 ScriptMgnIntf.cpp 的 TVPGetAppPath()+"patch.tjs"）。
+        async function fetchRemoteGame(archives, files) {
             loadingOverlay.classList.remove('hidden');
             statusElement.textContent = 'Probing game data...';
             progressFill.style.width = '0%';
             try {
                 await vlfsReady;
-                var ranges = false, size = -1;
-                try {
-                    var head = await fetch(url, { method: 'HEAD' });
-                    if (head.ok) {
-                        ranges = (head.headers.get('Accept-Ranges') || '').toLowerCase() === 'bytes';
-                        size = parseInt(head.headers.get('Content-Length') || '-1', 10);
-                    }
-                } catch (e) {}
-
-                if (ranges && size > 0) {
-                    VLFS.registerRemote('/data.xp3', url, size, true);
-                    console.log('[vlfs] remote xp3 (Range): ' + url + ', ' + size + ' bytes');
-                } else {
-                    statusElement.textContent = 'Downloading game data...';
-                    var blob = await fetchBlobWithProgress(url, function(loaded, total) {
-                        if (total > 0) {
-                            var pct = Math.round(loaded / total * 100);
-                            progressFill.style.width = pct + '%';
-                            statusElement.textContent = 'Downloading... ' + pct + '%';
-                        } else {
-                            statusElement.textContent = 'Downloading... ' + (loaded / 1048576).toFixed(1) + ' MB';
-                        }
-                    });
-                    VLFS.registerBlobFile('/data.xp3', blob);
-                    console.log('[vlfs] remote xp3 (whole blob): ' + blob.size + ' bytes');
+                for (var i = 0; i < archives.length; i++) {
+                    var url = archives[i];
+                    var base = url.split('#')[0].split('?')[0].split('/').pop();
+                    try { base = decodeURIComponent(base); } catch (e) {}
+                    if (!base) base = 'data.xp3';
+                    await registerRemotePath('/' + base, url);
+                }
+                for (var j = 0; j < files.length; j++) {
+                    var spec = files[j];
+                    var sep = spec.indexOf('@');
+                    if (sep <= 0) continue;
+                    var vpath = spec.slice(0, sep).trim();
+                    var fileUrl = spec.slice(sep + 1).trim();
+                    if (!vpath || !fileUrl) continue;
+                    if (vpath.charAt(0) !== '/') vpath = '/' + vpath;
+                    await registerRemotePath(vpath, fileUrl);
                 }
                 startGame();
             } catch (err) {
                 statusElement.textContent = 'Download failed: ' + err.message;
                 progressFill.style.width = '0%';
-                console.error('fetchXp3FromUrl error:', err);
+                console.error('fetchRemoteGame error:', err);
                 showFilePicker();
                 loadingOverlay.classList.add('hidden');
             }
@@ -2171,8 +2331,8 @@
             });
         } else if (gameZipUrl) {
             autoSelectSpace().then(function() { fetchAndExtractZip(gameZipUrl, entryXp3); });
-        } else if (xp3Url) {
-            autoSelectSpace().then(function() { fetchXp3FromUrl(xp3Url); });
+        } else if (xp3Url || remoteFiles.length) {
+            autoSelectSpace().then(function() { fetchRemoteGame(xp3Urls, remoteFiles); });
         }
 
         // --- File System Access API: directory picker + save sync ---
